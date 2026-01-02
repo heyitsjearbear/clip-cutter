@@ -1,3 +1,7 @@
+# Core dependencies
 google-genai>=1.0.0
 python-dotenv>=1.0.0
 yt-dlp>=2024.1.0
+
+# Caption generation (optional - for AssemblyAI captions)
+assemblyai>=0.26.0

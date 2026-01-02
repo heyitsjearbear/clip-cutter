@@ -1,82 +1,23 @@
 #!/usr/bin/env python3
 """
 Clip Cutter - Extract viral clips from YouTube videos for social media.
+
+Interactive CLI tool - just run: python clipper.py
 """
 
-import argparse
-import itertools
 import json
 import os
 import re
 import subprocess
 import sys
-import tempfile
-import threading
-import time
-from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-
-class Spinner:
-    """Animated spinner for long-running operations."""
-
-    def __init__(self, message: str = ""):
-        self.message = message
-        self.running = False
-        self.thread = None
-        self.frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
-    def _spin(self):
-        for frame in itertools.cycle(self.frames):
-            if not self.running:
-                break
-            print(f"\r{frame} {self.message}", end="", flush=True)
-            time.sleep(0.1)
-
-    def start(self):
-        self.running = True
-        self.thread = threading.Thread(target=self._spin)
-        self.thread.start()
-
-    def stop(self, final_message: str = ""):
-        self.running = False
-        if self.thread:
-            self.thread.join()
-        # Clear the line and print final message
-        print(f"\r{' ' * (len(self.message) + 5)}\r", end="")
-        if final_message:
-            print(final_message)
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, *args):
-        self.stop()
-
-
-class ProgressBar:
-    """Progress bar for operations with known duration."""
-
-    def __init__(self, total: float, width: int = 30, prefix: str = ""):
-        self.total = total
-        self.width = width
-        self.prefix = prefix
-        self.current = 0
-
-    def update(self, current: float):
-        self.current = min(current, self.total)
-        percent = self.current / self.total if self.total > 0 else 0
-        filled = int(self.width * percent)
-        bar = "█" * filled + "░" * (self.width - filled)
-        percent_str = f"{percent * 100:5.1f}%"
-        print(f"\r   {self.prefix}[{bar}] {percent_str}", end="", flush=True)
-
-    def finish(self):
-        self.update(self.total)
-        print()
+from clip_cutter.models import Clip
+from clip_cutter.utils import Spinner
+from clip_cutter.render import check_ffmpeg, render_clip
+from clip_cutter.seo import generate_seo_for_clips, save_all_seo_captions, SEOCaption
 
 load_dotenv()
 
@@ -87,32 +28,47 @@ OUTPUTS_DIR = SCRIPT_DIR / "outputs"
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
 
 
-@dataclass
-class Clip:
-    index: int
-    platform: str  # "tiktok" | "linkedin" | "reels"
-    start: float  # seconds
-    end: float  # seconds
-    transcript: str  # the words in this clip
-    hook: str  # the attention-grabbing opener
-    caption: str | None  # LinkedIn caption (only for linkedin clips)
-
-    @property
-    def duration(self) -> int:
-        return int(self.end - self.start)
+def clear_line():
+    """Clear the current terminal line."""
+    print("\r" + " " * 60 + "\r", end="")
 
 
-def check_ffmpeg() -> bool:
-    """Check if FFmpeg is installed."""
-    try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            check=True,
-        )
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
+def prompt_choice(question: str, options: list[str], default: int = 0) -> int:
+    """
+    Prompt user to select from a list of options.
+
+    Returns the index of the selected option.
+    """
+    print(f"\n{question}")
+    for i, option in enumerate(options):
+        marker = "→" if i == default else " "
+        print(f"  {marker} {i + 1}. {option}")
+
+    while True:
+        try:
+            choice = input(f"\nEnter choice [1-{len(options)}] (default: {default + 1}): ").strip()
+            if not choice:
+                return default
+            idx = int(choice) - 1
+            if 0 <= idx < len(options):
+                return idx
+            print(f"Please enter a number between 1 and {len(options)}")
+        except ValueError:
+            print("Please enter a valid number")
+
+
+def prompt_yes_no(question: str, default: bool = True) -> bool:
+    """Prompt user for yes/no answer."""
+    default_str = "Y/n" if default else "y/N"
+    while True:
+        answer = input(f"\n{question} [{default_str}]: ").strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("Please enter 'y' or 'n'")
 
 
 def extract_video_id(url: str) -> str | None:
@@ -129,7 +85,7 @@ def extract_video_id(url: str) -> str | None:
 
 
 def parse_timestamp(ts: str) -> float:
-    """Convert timestamp string to seconds. Handles M:SS, MM:SS, H:MM:SS, HH:MM:SS.mmm"""
+    """Convert timestamp string to seconds."""
     ts = ts.strip()
     parts = ts.replace(",", ".").split(":")
     if len(parts) == 2:
@@ -150,10 +106,7 @@ def format_timestamp(seconds: float) -> str:
 
 
 def download_video(youtube_url: str) -> tuple[Path, str]:
-    """
-    Download YouTube video and transcript.
-    Returns: (video_path, transcript_text)
-    """
+    """Download YouTube video and transcript."""
     video_id = extract_video_id(youtube_url)
     if not video_id:
         raise ValueError(f"Could not extract video ID from URL: {youtube_url}")
@@ -161,7 +114,6 @@ def download_video(youtube_url: str) -> tuple[Path, str]:
     TMP_DIR.mkdir(exist_ok=True)
     video_path = TMP_DIR / f"{video_id}.mp4"
 
-    # Download video with progress
     spinner = Spinner(f"Downloading video {video_id}...")
     spinner.start()
 
@@ -175,7 +127,6 @@ def download_video(youtube_url: str) -> tuple[Path, str]:
     subprocess.run(video_cmd, check=True, capture_output=True)
     spinner.stop(f"✅ Downloaded: {video_path.name}")
 
-    # Download captions for transcript
     spinner = Spinner("Fetching transcript...")
     spinner.start()
 
@@ -190,19 +141,18 @@ def download_video(youtube_url: str) -> tuple[Path, str]:
     ]
     subprocess.run(captions_cmd, capture_output=True)
 
-    # Look for captions file (might have different naming)
     vtt_files = list(TMP_DIR.glob(f"{video_id}*.vtt"))
     if vtt_files:
         transcript = parse_vtt_to_transcript(vtt_files[0])
         spinner.stop(f"📝 Transcript loaded: {len(transcript)} chars")
         return video_path, transcript
     else:
-        spinner.stop("⚠️  No transcript found for this video")
+        spinner.stop("⚠️  No transcript found")
         return video_path, ""
 
 
 def parse_vtt_to_transcript(vtt_path: Path) -> str:
-    """Parse VTT file into timestamped transcript for Gemini."""
+    """Parse VTT file into timestamped transcript."""
     content = vtt_path.read_text(encoding="utf-8")
     lines = content.split("\n")
 
@@ -212,23 +162,18 @@ def parse_vtt_to_transcript(vtt_path: Path) -> str:
 
     for line in lines:
         line = line.strip()
-        # Skip header lines and empty
         if not line or line.startswith("WEBVTT") or line.startswith("Kind:") or line.startswith("Language:"):
             continue
 
-        # Check for timestamp line
         if "-->" in line:
             start_time = line.split("-->")[0].strip()
             current_time = parse_timestamp(start_time)
             continue
 
-        # Skip cue identifiers (lines that are just numbers or contain positioning)
         if line.isdigit() or line.startswith("align:") or line.startswith("position:"):
             continue
 
-        # Remove VTT formatting tags
-        text = re.sub(r"<[^>]+>", "", line)
-        text = text.strip()
+        text = re.sub(r"<[^>]+>", "", line).strip()
 
         if text and current_time is not None and text not in seen_text:
             seen_text.add(text)
@@ -240,13 +185,17 @@ def parse_vtt_to_transcript(vtt_path: Path) -> str:
 
 def find_clips(transcript: str) -> list[Clip]:
     """Use Gemini to identify viral clip opportunities."""
+    import time
     from google import genai
+    from google.genai import types
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY not set in environment")
 
-    client = genai.Client(api_key=api_key)
+    # 2 minute timeout to prevent runaway API costs
+    http_options = types.HttpOptions(client_args={"timeout": 120.0})
+    client = genai.Client(api_key=api_key, http_options=http_options)
 
     prompt_path = PROMPTS_DIR / "clip_extraction.txt"
     prompt = prompt_path.read_text(encoding="utf-8")
@@ -254,14 +203,27 @@ def find_clips(transcript: str) -> list[Clip]:
     spinner = Spinner("Analyzing transcript with AI...")
     spinner.start()
 
-    response = client.models.generate_content(
-        model="gemini-3-pro-preview",
-        contents=prompt + "\n\nTRANSCRIPT:\n" + transcript,
-    )
-    response_text = response.text.strip()
-    spinner.stop()
+    start_time = time.time()
+    try:
+        response = client.models.generate_content(
+            model="gemini-3-pro-preview",
+            contents=prompt + "\n\nTRANSCRIPT:\n" + transcript,
+        )
+        response_text = response.text.strip()
+        elapsed = time.time() - start_time
+        spinner.stop(f"✅ Analysis complete ({elapsed:.1f}s)")
+    except Exception as e:
+        elapsed = time.time() - start_time
+        spinner.stop()
+        print(f"\n❌ GEMINI API ERROR (clip extraction)")
+        print(f"   Elapsed time: {elapsed:.1f}s before failure")
+        print(f"   Error type: {type(e).__name__}")
+        print(f"   Error message: {e}")
+        print(f"   Timeout was set to: 120s")
+        if elapsed >= 115:
+            print(f"   ⚠️  Likely a timeout - consider increasing timeout value")
+        raise
 
-    # Extract JSON from response (handle markdown code blocks)
     if "```json" in response_text:
         response_text = response_text.split("```json")[1].split("```")[0]
     elif "```" in response_text:
@@ -270,8 +232,7 @@ def find_clips(transcript: str) -> list[Clip]:
     try:
         clips_data = json.loads(response_text)
     except json.JSONDecodeError as e:
-        print(f"❌ Failed to parse Gemini response: {e}")
-        print(f"Raw response:\n{response.text[:500]}")
+        print(f"❌ Failed to parse AI response: {e}")
         raise
 
     clips = []
@@ -287,32 +248,34 @@ def find_clips(transcript: str) -> list[Clip]:
         )
         clips.append(clip)
 
-    print(f"✅ Found {len(clips)} clips")
+    print(f"✅ Found {len(clips)} potential clips")
     return clips
 
 
-def select_clips(clips: list[Clip], select_all: bool = False) -> list[Clip]:
-    """Interactive terminal UI for selecting clips."""
-    if select_all:
-        return clips
-
-    print("\n" + "-" * 60)
-    print("📋 SELECT CLIPS TO PROCESS")
-    print("-" * 60)
-    print("Enter clip numbers (comma-separated), 'all', or 'q' to quit:\n")
+def select_clips(clips: list[Clip]) -> list[Clip]:
+    """Interactive clip selection."""
+    print("\n" + "─" * 60)
+    print("📋 AVAILABLE CLIPS")
+    print("─" * 60)
 
     for clip in clips:
         platform_label = f"[{clip.platform.upper():8}]"
         duration = f"{clip.duration:3}s"
-        preview = clip.hook[:45] + "..." if len(clip.hook) > 45 else clip.hook
-        print(f"  {clip.index}. {platform_label} {duration} | \"{preview}\"")
+        preview = clip.hook[:42] + "..." if len(clip.hook) > 42 else clip.hook
+        print(f"  {clip.index}. {platform_label} {duration} │ \"{preview}\"")
+
+    print("\n" + "─" * 60)
 
     while True:
-        print()
-        selection = input("> ").strip().lower()
+        print("\nOptions:")
+        print("  • Enter clip numbers (e.g., 1,3,5)")
+        print("  • 'all' to process all clips")
+        print("  • 'q' to quit")
+
+        selection = input("\nYour selection: ").strip().lower()
 
         if selection == "q":
-            print("Quitting...")
+            print("Goodbye!")
             sys.exit(0)
 
         if selection == "all":
@@ -322,108 +285,12 @@ def select_clips(clips: list[Clip], select_all: bool = False) -> list[Clip]:
             indices = [int(x.strip()) for x in selection.split(",")]
             selected = [c for c in clips if c.index in indices]
             if not selected:
-                print("❌ No valid clips selected. Try again.")
+                print("❌ No valid clips selected")
                 continue
+            print(f"✓ Selected {len(selected)} clip(s)")
             return selected
         except ValueError:
-            print("❌ Invalid input. Enter numbers separated by commas, 'all', or 'q'.")
-
-
-def parse_ffmpeg_time(time_str: str) -> float:
-    """Parse FFmpeg time string (HH:MM:SS.ms) to seconds."""
-    parts = time_str.split(":")
-    if len(parts) == 3:
-        h, m, s = parts
-        return int(h) * 3600 + int(m) * 60 + float(s)
-    return 0
-
-
-def render_clip(video_path: Path, clip: Clip, output_dir: Path) -> Path:
-    """Render a single vertical clip with FFmpeg."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"clip_{clip.index}_{clip.platform}.mp4"
-
-    print(f"\nClip {clip.index} ({clip.platform}):")
-
-    # Build filter complex: blurred background + sharp foreground centered
-    filter_complex = ";".join([
-        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[bg]",
-        "[0:v]scale=1080:-1[fg]",
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2",
-    ])
-
-    clip_duration = clip.end - clip.start
-    cmd = [
-        "ffmpeg", "-y",
-        "-accurate_seek",
-        "-ss", str(clip.start),
-        "-i", str(video_path),
-        "-t", str(clip_duration),
-        "-filter_complex", filter_complex,
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        "-progress", "pipe:1",
-        str(output_path),
-    ]
-
-    duration = clip.end - clip.start
-    progress_bar = ProgressBar(duration, prefix="🎬 ")
-    progress_bar.update(0)  # Show initial 0% progress
-
-    # Collect stderr in background thread to prevent deadlock
-    stderr_output = []
-
-    def drain_stderr(pipe):
-        for line in pipe:
-            stderr_output.append(line)
-
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-        )
-
-        # Start background thread to drain stderr (prevents deadlock)
-        stderr_thread = threading.Thread(target=drain_stderr, args=(process.stderr,))
-        stderr_thread.daemon = True
-        stderr_thread.start()
-
-        # Parse FFmpeg progress output from stdout
-        for line in process.stdout:
-            if line.startswith("out_time="):
-                time_str = line.split("=")[1].strip()
-                if time_str and time_str != "N/A":
-                    current_time = parse_ffmpeg_time(time_str)
-                    progress_bar.update(current_time)
-
-        process.wait()
-        stderr_thread.join(timeout=5)
-        progress_bar.finish()
-
-        if process.returncode != 0:
-            stderr_str = "".join(stderr_output)
-            raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr_str.encode())
-
-        print(f"   ✅ Saved: {output_path.name}")
-
-    except subprocess.CalledProcessError as e:
-        stderr = e.stderr.decode() if e.stderr else "".join(stderr_output)
-        print(f"\n   ❌ FFmpeg error: {stderr[-500:]}")
-        raise
-
-    # Save LinkedIn caption if present
-    if clip.caption and clip.platform == "linkedin":
-        caption_path = output_dir / f"clip_{clip.index}_caption.txt"
-        caption_path.write_text(clip.caption, encoding="utf-8")
-        print(f"   📝 Caption saved: {caption_path.name}")
-
-    return output_path
+            print("❌ Invalid input")
 
 
 def cleanup_tmp():
@@ -438,56 +305,149 @@ def cleanup_tmp():
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Extract viral clips from YouTube videos for social media."
-    )
-    parser.add_argument("url", help="YouTube video URL")
-    parser.add_argument("--all", action="store_true", help="Process all clips without prompting")
-    parser.add_argument("--output", type=Path, default=OUTPUTS_DIR, help="Output directory")
-    args = parser.parse_args()
+    print("\n" + "═" * 60)
+    print("🎬 CLIP CUTTER")
+    print("   Extract viral clips from YouTube videos")
+    print("═" * 60)
 
-    # Check dependencies
+    # Check FFmpeg
     if not check_ffmpeg():
-        print("❌ FFmpeg not found. Please install FFmpeg and add it to your PATH.")
+        print("\n❌ FFmpeg not found. Please install FFmpeg first.")
         sys.exit(1)
 
-    print("\n" + "=" * 60)
-    print("🎬 CLIP CUTTER")
-    print("=" * 60)
+    # Step 1: Get YouTube URL
+    print("\n📺 STEP 1: Enter YouTube URL")
+    print("─" * 60)
+
+    while True:
+        url = input("\nPaste YouTube URL: ").strip()
+        if not url:
+            print("Please enter a URL")
+            continue
+        if extract_video_id(url):
+            break
+        print("❌ Invalid YouTube URL. Try again.")
 
     try:
-        # Download video and transcript
-        video_path, transcript = download_video(args.url)
+        # Step 2: Download video
+        print("\n⬇️  STEP 2: Downloading")
+        print("─" * 60)
+        video_path, transcript = download_video(url)
 
         if not transcript:
-            response = input("\n⚠️  No transcript found. Continue anyway? (y/n): ").strip().lower()
-            if response != "y":
+            if not prompt_yes_no("No transcript found. Continue anyway?", default=False):
                 print("Exiting.")
                 sys.exit(0)
 
-        # Find clips with Gemini
+        # Step 3: Analyze and select clips
+        print("\n🔍 STEP 3: AI Analysis")
+        print("─" * 60)
         clips = find_clips(transcript)
+        selected = select_clips(clips)
 
-        # Select clips
-        selected = select_clips(clips, select_all=args.all)
+        # Step 4: SEO Caption Generation
+        print("\n🔎 STEP 4: SEO Caption Generation")
+        print("─" * 60)
 
-        # Render clips
-        video_id = extract_video_id(args.url)
-        output_dir = args.output / video_id
+        seo_captions: dict[int, SEOCaption] = {}
+        video_id = extract_video_id(url)
+        output_dir = OUTPUTS_DIR / video_id
 
-        print("\n" + "-" * 60)
-        print(f"🎬 PROCESSING {len(selected)} CLIPS")
-        print("-" * 60)
+        if prompt_yes_no("Generate SEO-optimized captions with trending hashtags?", default=True):
+            print("\nUsing Gemini with Google Search to research trending hashtags...")
+            seo_captions = generate_seo_for_clips(selected)
+
+            # Save SEO data as JSON sidecar files
+            saved_paths = save_all_seo_captions(selected, seo_captions, output_dir)
+            print(f"Saved {len(saved_paths)} SEO caption files to {output_dir}/")
+
+            # Show preview of generated captions
+            if prompt_yes_no("Preview SEO captions?", default=False):
+                for clip in selected:
+                    if clip.index in seo_captions:
+                        seo = seo_captions[clip.index]
+                        print(f"\n{'─' * 40}")
+                        print(f"Clip {clip.index} ({clip.platform.upper()}):")
+                        print(f"Keywords: {', '.join(seo.topic_keywords[:3])}")
+                        print(f"Hashtags ({len(seo.hashtags)}): {' '.join('#' + h for h in seo.hashtags[:5])}...")
+                        print(f"\nCaption:\n{seo.caption[:200]}{'...' if len(seo.caption) > 200 else ''}")
+        else:
+            print("Skipping SEO caption generation.")
+
+        # Step 5: Video Caption options (subtitles)
+        print("\n💬 STEP 5: Video Caption Options")
+        print("─" * 60)
+
+        caption_choice = prompt_choice(
+            "How would you like to generate captions?",
+            [
+                "No captions (video only)",
+                "AssemblyAI - Professional transcription with TikTok-style highlighting",
+            ],
+            default=0
+        )
+
+        use_assemblyai = caption_choice == 1
+        caption_style = "standard"
+
+        if use_assemblyai:
+            # Check API key
+            if not os.environ.get("ASSEMBLYAI_API_KEY"):
+                print("\n⚠️  ASSEMBLYAI_API_KEY not found in .env")
+                print("   Get your free key at: https://www.assemblyai.com/")
+                if not prompt_yes_no("Continue without captions?", default=True):
+                    sys.exit(0)
+                use_assemblyai = False
+            else:
+                style_choice = prompt_choice(
+                    "Caption style:",
+                    [
+                        "TikTok - Bold, word-by-word highlighting (recommended)",
+                        "Standard - Simple white text",
+                    ],
+                    default=0
+                )
+                caption_style = "tiktok" if style_choice == 0 else "standard"
+
+        # Step 6: Render clips
+        print("\n🎬 STEP 6: Rendering Clips")
+        print("─" * 60)
 
         for clip in selected:
-            render_clip(video_path, clip, output_dir)
+            captions_path = None
 
-        # Cleanup tmp directory
+            if use_assemblyai:
+                from clip_cutter.captions import create_captions_for_clip
+
+                print(f"\n📝 Generating captions for clip {clip.index}...")
+                # Store .ass files in tmp (will be cleaned up later)
+                captions_path = TMP_DIR / f"clip_{clip.index}_{clip.platform}.ass"
+                captions_path.parent.mkdir(parents=True, exist_ok=True)
+
+                create_captions_for_clip(
+                    video_path=video_path,
+                    clip_start=clip.start,
+                    clip_end=clip.end,
+                    output_path=captions_path,
+                    style=caption_style,
+                    chars_per_line=32,
+                )
+
+            render_clip(
+                video_path=video_path,
+                clip=clip,
+                output_dir=output_dir,
+                captions_path=captions_path,
+            )
+
+        # Cleanup
         cleanup_tmp()
 
-        print("\n" + "=" * 60)
-        print(f"🎉 DONE! Clips saved to: {output_dir}/")
-        print("=" * 60 + "\n")
+        # Done!
+        print("\n" + "═" * 60)
+        print(f"🎉 DONE!")
+        print(f"   Clips saved to: {output_dir}/")
+        print("═" * 60 + "\n")
 
     except KeyboardInterrupt:
         print("\n\nCancelled.")
