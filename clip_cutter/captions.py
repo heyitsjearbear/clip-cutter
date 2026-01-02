@@ -187,6 +187,7 @@ def generate_ass_subtitles(
     words: list[WordTimestamp],
     style: str = "tiktok",
     chars_per_line: int = 32,
+    end_padding: float = 0.5,
 ) -> str:
     """
     Generate ASS subtitle file content with word-by-word highlighting.
@@ -195,6 +196,7 @@ def generate_ass_subtitles(
         words: List of words with timing info
         style: "standard" or "tiktok" (karaoke highlighting with pop effect)
         chars_per_line: Max characters before line break
+        end_padding: Extra time to add to the last caption (matches video padding)
 
     Returns:
         Complete ASS file content as string
@@ -245,10 +247,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     if style == "tiktok":
         # Generate pop effect with per-word scaling
-        events = _generate_pop_karaoke_events(words, chars_per_line)
+        events = _generate_pop_karaoke_events(words, chars_per_line, end_padding)
     else:
         # Standard: Show phrases without highlighting
-        events = _generate_standard_events(words, chars_per_line)
+        events = _generate_standard_events(words, chars_per_line, end_padding)
 
     return header + "\n".join(events)
 
@@ -256,6 +258,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 def _generate_pop_karaoke_events(
     words: list[WordTimestamp],
     chars_per_line: int,
+    end_padding: float = 0.5,
 ) -> list[str]:
     """
     Generate karaoke events with pop effect - active word scales up.
@@ -263,13 +266,19 @@ def _generate_pop_karaoke_events(
     Each phrase is shown with all words visible, but the active word
     is highlighted (blue) and scaled larger. Captions stay on screen
     continuously within a chunk - no flashing during pauses.
+
+    Args:
+        words: List of words with timing info
+        chars_per_line: Max characters before line break
+        end_padding: Extra time to add to the very last caption (matches video padding)
     """
     events = []
 
     # Group words into display chunks
     chunks = _group_words_into_chunks(words, chars_per_line)
+    total_chunks = len(chunks)
 
-    for chunk in chunks:
+    for chunk_idx, chunk in enumerate(chunks):
         if not chunk:
             continue
 
@@ -288,6 +297,10 @@ def _generate_pop_karaoke_events(
             else:
                 # Last word in chunk: extend to chunk end
                 event_end = chunk_end
+                # For the very last word of the very last chunk, add padding
+                # to match the video's end padding
+                if chunk_idx == total_chunks - 1:
+                    event_end += end_padding
 
             # Calculate animation duration based on actual word duration (not event duration)
             word_duration_ms = int((active_word.end - active_word.start) * 1000)
@@ -325,18 +338,26 @@ def _generate_pop_karaoke_events(
 def _generate_standard_events(
     words: list[WordTimestamp],
     chars_per_line: int,
+    end_padding: float = 0.5,
 ) -> list[str]:
     """Generate standard subtitle events without highlighting."""
     events = []
 
     chunks = _group_words_into_chunks(words, chars_per_line)
+    total_chunks = len(chunks)
 
-    for chunk in chunks:
+    for chunk_idx, chunk in enumerate(chunks):
         if not chunk:
             continue
 
         start_time = format_ass_time(chunk[0].start)
-        end_time = format_ass_time(chunk[-1].end)
+
+        # For the last chunk, add padding to match video's end padding
+        chunk_end = chunk[-1].end
+        if chunk_idx == total_chunks - 1:
+            chunk_end += end_padding
+
+        end_time = format_ass_time(chunk_end)
 
         text = " ".join(w.text for w in chunk)
 
@@ -379,6 +400,7 @@ def create_captions_for_clip(
     output_path: Path,
     style: str = "tiktok",
     chars_per_line: int = 32,
+    end_padding: float = 0.5,
 ) -> Path:
     """
     Create ASS caption file for a video clip.
@@ -390,6 +412,7 @@ def create_captions_for_clip(
         output_path: Path to save ASS file
         style: Caption style ("standard" or "tiktok")
         chars_per_line: Max characters per caption line
+        end_padding: Extra time to add to last caption (matches video padding)
 
     Returns:
         Path to created ASS file
@@ -400,7 +423,7 @@ def create_captions_for_clip(
     if not result.words:
         print("   ⚠️  No words detected in audio")
         # Create empty ASS file
-        output_path.write_text(generate_ass_subtitles([], style), encoding="utf-8")
+        output_path.write_text(generate_ass_subtitles([], style, end_padding=end_padding), encoding="utf-8")
         return output_path
 
     # Generate ASS content
@@ -408,6 +431,7 @@ def create_captions_for_clip(
         result.words,
         style=style,
         chars_per_line=chars_per_line,
+        end_padding=end_padding,
     )
 
     # Save to file
