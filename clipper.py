@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Clip Cutter - Extract viral clips from YouTube videos for social media.
+Clip Cutter - Extract viral clips from videos for social media.
 
 Interactive CLI tool - just run: python clipper.py
+Supports both YouTube URLs and local video file uploads.
 """
 
 import json
@@ -10,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -183,6 +185,111 @@ def parse_vtt_to_transcript(vtt_path: Path) -> str:
     return "\n".join(transcript_lines)
 
 
+def upload_video_to_gemini(video_path: Path):
+    """Upload a video file to Gemini Files API and wait for processing."""
+    from google import genai
+    from google.genai import types
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not set in environment")
+
+    http_options = types.HttpOptions(client_args={"timeout": 600.0})
+    client = genai.Client(api_key=api_key, http_options=http_options)
+
+    spinner = Spinner(f"Uploading {video_path.name} to Gemini...")
+    spinner.start()
+
+    try:
+        uploaded_file = client.files.upload(file=str(video_path))
+        spinner.stop(f"✅ Uploaded: {uploaded_file.name}")
+    except Exception as e:
+        spinner.stop()
+        raise RuntimeError(f"Failed to upload video: {e}")
+
+    # Poll until the file is processed
+    spinner = Spinner("Processing video (this may take a few minutes)...")
+    spinner.start()
+
+    while not uploaded_file.state or uploaded_file.state.name != "ACTIVE":
+        time.sleep(5)
+        uploaded_file = client.files.get(name=uploaded_file.name)
+        if uploaded_file.state and uploaded_file.state.name == "FAILED":
+            spinner.stop()
+            raise RuntimeError("Video processing failed on Gemini servers")
+
+    spinner.stop("✅ Video processed and ready")
+    return client, uploaded_file
+
+
+def find_clips_from_video(client, uploaded_file) -> list[Clip]:
+    """Use Gemini to identify viral clip opportunities by analyzing the actual video."""
+    from google.genai import types
+
+    prompt_path = PROMPTS_DIR / "clip_extraction.txt"
+    prompt = prompt_path.read_text(encoding="utf-8")
+
+    # Modify prompt to indicate we're analyzing video directly
+    video_prompt = prompt.replace(
+        "TRANSCRIPT:",
+        "VIDEO CONTENT (analyze both visual and audio):"
+    )
+    video_prompt += "\n\nAnalyze the video above and identify viral clips. Pay attention to both what is said AND visual elements like facial expressions, gestures, and on-screen action."
+
+    spinner = Spinner("Analyzing video with AI (visual + audio)...")
+    spinner.start()
+
+    start_time = time.time()
+    try:
+        response = client.models.generate_content(
+            model="gemini-3-pro-preview",
+            contents=[uploaded_file, video_prompt],
+        )
+        response_text = response.text.strip()
+        elapsed = time.time() - start_time
+        spinner.stop(f"✅ Analysis complete ({elapsed:.1f}s)")
+    except Exception as e:
+        elapsed = time.time() - start_time
+        spinner.stop()
+        print(f"\n❌ GEMINI API ERROR (video analysis)")
+        print(f"   Elapsed time: {elapsed:.1f}s before failure")
+        print(f"   Error type: {type(e).__name__}")
+        print(f"   Error message: {e}")
+        raise
+
+    if "```json" in response_text:
+        response_text = response_text.split("```json")[1].split("```")[0]
+    elif "```" in response_text:
+        response_text = response_text.split("```")[1].split("```")[0]
+
+    try:
+        clips_data = json.loads(response_text)
+    except json.JSONDecodeError as e:
+        print(f"❌ Failed to parse AI response: {e}")
+        raise
+
+    clips = []
+    for i, data in enumerate(clips_data, 1):
+        clip = Clip(
+            index=i,
+            platform=data["platform"].lower(),
+            start=parse_timestamp(data["start"]),
+            end=parse_timestamp(data["end"]),
+            transcript=data["transcript"],
+            hook=data["hook"],
+            caption=data.get("caption"),
+        )
+        clips.append(clip)
+
+    print(f"✅ Found {len(clips)} potential clips")
+    return clips
+
+
+def get_video_id_from_path(video_path: Path) -> str:
+    """Generate a unique ID from a local video file path."""
+    return video_path.stem.replace(" ", "_")[:50]
+
+
 def find_clips(transcript: str) -> list[Clip]:
     """Use Gemini to identify viral clip opportunities."""
     import time
@@ -307,7 +414,7 @@ def cleanup_tmp():
 def main():
     print("\n" + "═" * 60)
     print("🎬 CLIP CUTTER")
-    print("   Extract viral clips from YouTube videos")
+    print("   Extract viral clips from videos")
     print("═" * 60)
 
     # Check FFmpeg
@@ -315,26 +422,89 @@ def main():
         print("\n❌ FFmpeg not found. Please install FFmpeg first.")
         sys.exit(1)
 
-    # Step 1: Get YouTube URL
-    print("\n📺 STEP 1: Enter YouTube URL")
+    # Step 1: Choose video source
+    print("\n📺 STEP 1: Choose Video Source")
     print("─" * 60)
 
-    while True:
-        url = input("\nPaste YouTube URL: ").strip()
-        if not url:
-            print("Please enter a URL")
-            continue
-        if extract_video_id(url):
+    source_choice = prompt_choice(
+        "How would you like to provide your video?",
+        [
+            "YouTube URL - Download and extract transcript",
+            "Local File - Upload video to Gemini for visual + audio analysis",
+        ],
+        default=0
+    )
+
+    use_local_file = source_choice == 1
+    video_path = None
+    transcript = ""
+    video_id = None
+    gemini_client = None
+    uploaded_file = None
+
+    if use_local_file:
+        # Local file upload flow
+        print("\n📁 Local Video Upload")
+        print("─" * 60)
+        print("Supported formats: MP4, MOV, AVI, MKV, WEBM")
+        print("Note: Large files may take several minutes to upload and process.\n")
+
+        while True:
+            file_input = input("Enter path to video file: ").strip()
+            # Remove quotes if user wrapped path in them
+            file_input = file_input.strip("\"'")
+
+            if not file_input:
+                print("Please enter a file path")
+                continue
+
+            video_path = Path(file_input).expanduser().resolve()
+
+            if not video_path.exists():
+                print(f"❌ File not found: {video_path}")
+                continue
+
+            if not video_path.is_file():
+                print(f"❌ Not a file: {video_path}")
+                continue
+
+            valid_extensions = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+            if video_path.suffix.lower() not in valid_extensions:
+                print(f"❌ Unsupported format: {video_path.suffix}")
+                print(f"   Supported: {', '.join(valid_extensions)}")
+                continue
+
             break
-        print("❌ Invalid YouTube URL. Try again.")
+
+        video_id = get_video_id_from_path(video_path)
+        print(f"\n✅ Selected: {video_path.name}")
+        print(f"   Size: {video_path.stat().st_size / (1024*1024):.1f} MB")
+
+    else:
+        # YouTube URL flow
+        while True:
+            url = input("\nPaste YouTube URL: ").strip()
+            if not url:
+                print("Please enter a URL")
+                continue
+            if extract_video_id(url):
+                video_id = extract_video_id(url)
+                break
+            print("❌ Invalid YouTube URL. Try again.")
 
     try:
-        # Step 2: Download video
-        print("\n⬇️  STEP 2: Downloading")
+        # Step 2: Download/Upload video
+        print("\n⬇️  STEP 2: " + ("Uploading to Gemini" if use_local_file else "Downloading"))
         print("─" * 60)
-        video_path, transcript = download_video(url)
 
-        if not transcript:
+        if use_local_file:
+            # Upload to Gemini Files API
+            gemini_client, uploaded_file = upload_video_to_gemini(video_path)
+        else:
+            # Download from YouTube
+            video_path, transcript = download_video(url)
+
+        if not use_local_file and not transcript:
             if not prompt_yes_no("No transcript found. Continue anyway?", default=False):
                 print("Exiting.")
                 sys.exit(0)
@@ -342,7 +512,14 @@ def main():
         # Step 3: Analyze and select clips
         print("\n🔍 STEP 3: AI Analysis")
         print("─" * 60)
-        clips = find_clips(transcript)
+
+        if use_local_file:
+            # Analyze video directly with Gemini vision
+            clips = find_clips_from_video(gemini_client, uploaded_file)
+        else:
+            # Analyze transcript only
+            clips = find_clips(transcript)
+
         selected = select_clips(clips)
 
         # Step 4: SEO Caption Generation
@@ -350,7 +527,6 @@ def main():
         print("─" * 60)
 
         seo_captions: dict[int, SEOCaption] = {}
-        video_id = extract_video_id(url)
         output_dir = OUTPUTS_DIR / video_id
 
         if prompt_yes_no("Generate SEO-optimized captions with trending hashtags?", default=True):
