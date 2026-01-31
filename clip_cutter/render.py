@@ -1,8 +1,11 @@
 """FFmpeg video rendering for clip-cutter."""
 
+import os
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
+from typing import Optional
 
 from .models import Clip
 from .utils import ProgressBar
@@ -34,7 +37,7 @@ def render_clip(
     video_path: Path,
     clip: Clip,
     output_dir: Path,
-    captions_path: Path | None = None,
+    captions_path: Optional[Path] = None,
 ) -> Path:
     """
     Render a single vertical clip with FFmpeg.
@@ -49,9 +52,11 @@ def render_clip(
         Path to rendered clip
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"clip_{clip.index}_{clip.platform}.mp4"
+    # Use platform for viral clips, moment_type for demo clips
+    clip_label = clip.platform or clip.moment_type or "clip"
+    output_path = output_dir / f"clip_{clip.index}_{clip_label}.mp4"
 
-    print(f"\nClip {clip.index} ({clip.platform}):")
+    print(f"\nClip {clip.index} ({clip_label}):")
 
     # Build filter complex: blurred background + sharp foreground centered
     filter_parts = [
@@ -61,10 +66,17 @@ def render_clip(
     ]
 
     # Add captions if provided
+    temp_subs_path = None
     if captions_path and captions_path.exists():
-        # Escape path for FFmpeg (handle Windows paths and special chars)
-        escaped_path = str(captions_path).replace("\\", "/").replace(":", "\\:")
-        filter_parts.append(f"[main]ass='{escaped_path}'[out]")
+        # FFmpeg filter escaping is notoriously complex
+        # Simplest solution: copy to a simple /tmp path
+        temp_subs_path = Path(f"/tmp/subs_{os.getpid()}.ass")
+        if temp_subs_path.exists():
+            temp_subs_path.unlink()
+        # Copy file instead of symlink for maximum compatibility
+        import shutil
+        shutil.copy(captions_path, temp_subs_path)
+        filter_parts.append(f"[main]subtitles=filename={temp_subs_path}[out]")
         final_output = "[out]"
     else:
         final_output = "[main]"
@@ -147,6 +159,10 @@ def render_clip(
         stderr = e.stderr.decode() if e.stderr else "".join(stderr_output)
         print(f"\n   ❌ FFmpeg error: {stderr[-500:]}")
         raise
+    finally:
+        # Clean up temp symlink
+        if temp_subs_path and temp_subs_path.exists():
+            temp_subs_path.unlink()
 
     # Save LinkedIn caption if present
     if clip.caption and clip.platform == "linkedin":

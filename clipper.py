@@ -73,7 +73,7 @@ def prompt_yes_no(question: str, default: bool = True) -> bool:
         print("Please enter 'y' or 'n'")
 
 
-def extract_video_id(url: str) -> str | None:
+def extract_video_id(url: str) -> "str | None":
     """Extract video ID from various YouTube URL formats."""
     patterns = [
         r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})",
@@ -222,21 +222,29 @@ def upload_video_to_gemini(video_path: Path):
     return client, uploaded_file
 
 
-def find_clips_from_video(client, uploaded_file) -> list[Clip]:
-    """Use Gemini to identify viral clip opportunities by analyzing the actual video."""
+def find_clips_from_video(client, uploaded_file, prompt_type: str = "viral") -> list[Clip]:
+    """Use Gemini to identify clip opportunities by analyzing the actual video.
+
+    Args:
+        client: Gemini client
+        uploaded_file: Uploaded video file reference
+        prompt_type: "viral" for clip_extraction.txt, "demo" for demo_highlights.txt
+    """
     from google.genai import types
 
-    prompt_path = PROMPTS_DIR / "clip_extraction.txt"
+    if prompt_type == "demo":
+        prompt_path = PROMPTS_DIR / "demo_highlights.txt"
+        spinner_msg = "Analyzing video for wow moments..."
+    else:
+        prompt_path = PROMPTS_DIR / "clip_extraction.txt"
+        spinner_msg = "Analyzing video with AI (visual + audio)..."
+
     prompt = prompt_path.read_text(encoding="utf-8")
 
     # Modify prompt to indicate we're analyzing video directly
-    video_prompt = prompt.replace(
-        "TRANSCRIPT:",
-        "VIDEO CONTENT (analyze both visual and audio):"
-    )
-    video_prompt += "\n\nAnalyze the video above and identify viral clips. Pay attention to both what is said AND visual elements like facial expressions, gestures, and on-screen action."
+    video_prompt = prompt + "\n\nAnalyze the video above. Pay attention to both what is said AND visual elements like facial expressions, gestures, and on-screen action."
 
-    spinner = Spinner("Analyzing video with AI (visual + audio)...")
+    spinner = Spinner(spinner_msg)
     spinner.start()
 
     start_time = time.time()
@@ -270,15 +278,24 @@ def find_clips_from_video(client, uploaded_file) -> list[Clip]:
 
     clips = []
     for i, data in enumerate(clips_data, 1):
-        clip = Clip(
-            index=i,
-            platform=data["platform"].lower(),
-            start=parse_timestamp(data["start"]),
-            end=parse_timestamp(data["end"]),
-            transcript=data["transcript"],
-            hook=data["hook"],
-            caption=data.get("caption"),
-        )
+        if prompt_type == "demo":
+            clip = Clip(
+                index=i,
+                start=parse_timestamp(data["start"]),
+                end=parse_timestamp(data["end"]),
+                transcript=data["transcript"],
+                moment_type=data.get("moment_type"),
+            )
+        else:
+            clip = Clip(
+                index=i,
+                start=parse_timestamp(data["start"]),
+                end=parse_timestamp(data["end"]),
+                transcript=data["transcript"],
+                platform=data["platform"].lower(),
+                hook=data["hook"],
+                caption=data.get("caption"),
+            )
         clips.append(clip)
 
     print(f"✅ Found {len(clips)} potential clips")
@@ -290,8 +307,13 @@ def get_video_id_from_path(video_path: Path) -> str:
     return video_path.stem.replace(" ", "_")[:50]
 
 
-def find_clips(transcript: str) -> list[Clip]:
-    """Use Gemini to identify viral clip opportunities."""
+def find_clips(transcript: str, prompt_type: str = "viral") -> list[Clip]:
+    """Use Gemini to identify clip opportunities from transcript.
+
+    Args:
+        transcript: The video transcript text
+        prompt_type: "viral" for clip_extraction.txt, "demo" for demo_highlights.txt
+    """
     import time
     from google import genai
     from google.genai import types
@@ -304,10 +326,16 @@ def find_clips(transcript: str) -> list[Clip]:
     http_options = types.HttpOptions(client_args={"timeout": 120.0})
     client = genai.Client(api_key=api_key, http_options=http_options)
 
-    prompt_path = PROMPTS_DIR / "clip_extraction.txt"
+    if prompt_type == "demo":
+        prompt_path = PROMPTS_DIR / "demo_highlights.txt"
+        spinner_msg = "Analyzing transcript for wow moments..."
+    else:
+        prompt_path = PROMPTS_DIR / "clip_extraction.txt"
+        spinner_msg = "Analyzing transcript with AI..."
+
     prompt = prompt_path.read_text(encoding="utf-8")
 
-    spinner = Spinner("Analyzing transcript with AI...")
+    spinner = Spinner(spinner_msg)
     spinner.start()
 
     start_time = time.time()
@@ -344,15 +372,24 @@ def find_clips(transcript: str) -> list[Clip]:
 
     clips = []
     for i, data in enumerate(clips_data, 1):
-        clip = Clip(
-            index=i,
-            platform=data["platform"].lower(),
-            start=parse_timestamp(data["start"]),
-            end=parse_timestamp(data["end"]),
-            transcript=data["transcript"],
-            hook=data["hook"],
-            caption=data.get("caption"),
-        )
+        if prompt_type == "demo":
+            clip = Clip(
+                index=i,
+                start=parse_timestamp(data["start"]),
+                end=parse_timestamp(data["end"]),
+                transcript=data["transcript"],
+                moment_type=data.get("moment_type"),
+            )
+        else:
+            clip = Clip(
+                index=i,
+                start=parse_timestamp(data["start"]),
+                end=parse_timestamp(data["end"]),
+                transcript=data["transcript"],
+                platform=data["platform"].lower(),
+                hook=data["hook"],
+                caption=data.get("caption"),
+            )
         clips.append(clip)
 
     print(f"✅ Found {len(clips)} potential clips")
@@ -366,10 +403,17 @@ def select_clips(clips: list[Clip]) -> list[Clip]:
     print("─" * 60)
 
     for clip in clips:
-        platform_label = f"[{clip.platform.upper():8}]"
         duration = f"{clip.duration:3}s"
-        preview = clip.hook[:42] + "..." if len(clip.hook) > 42 else clip.hook
-        print(f"  {clip.index}. {platform_label} {duration} │ \"{preview}\"")
+        if clip.moment_type:
+            # Demo highlight format
+            type_label = f"[{clip.moment_type.replace('_', ' ').upper():18}]"
+            preview = clip.transcript[:40] + "..." if len(clip.transcript) > 40 else clip.transcript
+            print(f"  {clip.index}. {type_label} {duration} │ \"{preview}\"")
+        else:
+            # Viral clip format
+            platform_label = f"[{clip.platform.upper():8}]"
+            preview = clip.hook[:42] + "..." if len(clip.hook) > 42 else clip.hook
+            print(f"  {clip.index}. {platform_label} {duration} │ \"{preview}\"")
 
     print("\n" + "─" * 60)
 
@@ -436,6 +480,18 @@ def main():
     )
 
     use_local_file = source_choice == 1
+
+    # Choose analysis type
+    prompt_choice_idx = prompt_choice(
+        "What type of clips are you looking for?",
+        [
+            "Viral Clips - Short-form content for TikTok, Reels, Shorts, LinkedIn",
+            "Demo Highlights - Wow moments from sales/demo/onboarding calls",
+        ],
+        default=0
+    )
+    prompt_type = "demo" if prompt_choice_idx == 1 else "viral"
+
     video_path = None
     transcript = ""
     video_id = None
@@ -515,10 +571,10 @@ def main():
 
         if use_local_file:
             # Analyze video directly with Gemini vision
-            clips = find_clips_from_video(gemini_client, uploaded_file)
+            clips = find_clips_from_video(gemini_client, uploaded_file, prompt_type)
         else:
             # Analyze transcript only
-            clips = find_clips(transcript)
+            clips = find_clips(transcript, prompt_type)
 
         selected = select_clips(clips)
 
@@ -542,8 +598,9 @@ def main():
                 for clip in selected:
                     if clip.index in seo_captions:
                         seo = seo_captions[clip.index]
+                        clip_label = clip.platform or clip.moment_type or "clip"
                         print(f"\n{'─' * 40}")
-                        print(f"Clip {clip.index} ({clip.platform.upper()}):")
+                        print(f"Clip {clip.index} ({clip_label.upper()}):")
                         print(f"Keywords: {', '.join(seo.topic_keywords[:3])}")
                         print(f"Hashtags ({len(seo.hashtags)}): {' '.join('#' + h for h in seo.hashtags[:5])}...")
                         print(f"\nCaption:\n{seo.caption[:200]}{'...' if len(seo.caption) > 200 else ''}")
@@ -597,7 +654,8 @@ def main():
 
                 print(f"\n📝 Generating captions for clip {clip.index}...")
                 # Store .ass files in tmp (will be cleaned up later)
-                captions_path = TMP_DIR / f"clip_{clip.index}_{clip.platform}.ass"
+                clip_label = clip.platform or clip.moment_type or "clip"
+                captions_path = TMP_DIR / f"clip_{clip.index}_{clip_label}.ass"
                 captions_path.parent.mkdir(parents=True, exist_ok=True)
 
                 create_captions_for_clip(

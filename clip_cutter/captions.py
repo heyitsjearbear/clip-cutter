@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from .utils import Spinner
 
@@ -31,7 +32,7 @@ def extract_audio_segment(
     video_path: Path,
     start: float,
     end: float,
-    output_path: Path | None = None,
+    output_path: Optional[Path] = None,
 ) -> Path:
     """
     Extract audio segment from video using FFmpeg.
